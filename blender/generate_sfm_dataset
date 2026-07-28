@@ -1,0 +1,720 @@
+"""
+Blender SfM Benchmark Dataset Generator (v4 - FINAL)
+======================================================
+Output layout:
+
+  SfM_Dataset/
+  |-- images/                        rendered PNG views                 [student]
+  |-- camera_intrinsics.json         K + sensor/FOV/distortion(=0)       [student]
+  |-- camera_poses.json              R, t, P, quaternion, Blender 4x4,   [student]
+  |                                  view_neighbors, per-image metadata
+  |-- dataset_info.json              full dataset metadata               [student]
+  |-- preview.png                    quick visual grid of sample views   [student]
+  |-- README.txt                     auto-generated summary              [student]
+  |
+  `-- teacher_only/                  ANSWER KEY - do not hand to students
+        ground_truth_point_cloud.ply   vertices + normals + color
+        ground_truth_mesh.obj          mesh with faces + vertex normals
+        matches_gt.json                ray-cast-verified 2D<->3D matches
+        visibility_matrix.npy          dense (vertices x images) boolean
+        visibility_matrix_index.json   row/column meaning for the matrix
+
+Camera sampling plan:
+  3 orbits (elevation = -20, 0, +20 deg) x 18 views/orbit (azimuth step = 20 deg)
+  => 54 total images. Each orbit uses a slightly different radius
+  (1.8x / 2.0x / 2.2x model diagonal) so the camera path isn't a perfect sphere.
+
+Ground truth design note:
+  matches_gt.json / visibility_matrix.npy are built by projecting EVERY model
+  vertex onto EVERY image and keeping only vertices with a real, ray-cast-
+  verified line of sight to the camera. This is intentionally detector-agnostic
+  (not derived from SIFT/ORB/etc. keypoints) so it can be used as an independent
+  benchmark to evaluate ANY feature detector without circularity. If you later
+  want a SIFT-specific comparison, do that as a downstream notebook step
+  (match each detected SIFT keypoint to its nearest ground-truth vertex),
+  rather than baking SIFT into the ground truth itself.
+
+Deliberately NOT included:
+  UV texture coordinates were considered and skipped - they only matter for
+  texture/color-mapping work, which is out of scope for this SfM benchmark.
+  Add them later (export from model.data.uv_layers) only if a texture-mapping
+  exercise is actually added to the course.
+"""
+
+import bpy
+import math
+import json
+import os
+import datetime
+
+import numpy as np
+
+from mathutils import Vector, Matrix
+from mathutils.bvhtree import BVHTree
+
+
+# ==========================================================
+# 1. Paths
+# ==========================================================
+
+OUTPUT_DIR = "/content/SfM_Dataset"
+
+IMAGE_DIR = os.path.join(OUTPUT_DIR, "images")
+TEACHER_ONLY_DIR = os.path.join(OUTPUT_DIR, "teacher_only")
+
+os.makedirs(IMAGE_DIR, exist_ok=True)
+os.makedirs(TEACHER_ONLY_DIR, exist_ok=True)
+
+# Student-facing files (everything needed to RUN an SfM pipeline, no answers)
+POSE_FILE = os.path.join(OUTPUT_DIR, "camera_poses.json")
+INTRINSIC_FILE = os.path.join(OUTPUT_DIR, "camera_intrinsics.json")
+DATASET_INFO_FILE = os.path.join(OUTPUT_DIR, "dataset_info.json")
+PREVIEW_FILE = os.path.join(OUTPUT_DIR, "preview.png")
+README_FILE = os.path.join(OUTPUT_DIR, "README.txt")
+
+# Teacher-only files (ground truth / answer key - keep this folder out of what
+# students receive)
+GROUND_TRUTH_POINT_CLOUD = os.path.join(TEACHER_ONLY_DIR, "ground_truth_point_cloud.ply")
+GROUND_TRUTH_MESH = os.path.join(TEACHER_ONLY_DIR, "ground_truth_mesh.obj")
+MATCHES_FILE = os.path.join(TEACHER_ONLY_DIR, "matches_gt.json")
+VISIBILITY_MATRIX_FILE = os.path.join(TEACHER_ONLY_DIR, "visibility_matrix.npy")
+VISIBILITY_INDEX_FILE = os.path.join(TEACHER_ONLY_DIR, "visibility_matrix_index.json")
+
+
+# ==========================================================
+# 2. Render settings (Cycles, realistic lighting)
+# ==========================================================
+
+scene = bpy.context.scene
+scene.render.engine = "CYCLES"
+scene.cycles.samples = 128
+scene.cycles.use_denoising = True
+
+scene.render.resolution_x = 1920
+scene.render.resolution_y = 1080
+scene.render.resolution_percentage = 100
+scene.render.image_settings.file_format = "PNG"
+
+
+# ==========================================================
+# 3. World - neutral grey environment
+# ==========================================================
+
+world = bpy.data.worlds.new(name="Neutral_World")
+scene.world = world
+world.use_nodes = True
+bg_node = world.node_tree.nodes["Background"]
+bg_node.inputs[0].default_value = (0.5, 0.5, 0.5, 1.0)
+bg_node.inputs[1].default_value = 1.0
+
+
+# ==========================================================
+# 4. Lighting - two fixed suns (constant across all frames)
+# ==========================================================
+
+for obj in list(bpy.data.objects):
+    if obj.type == 'LIGHT':
+        bpy.data.objects.remove(obj, do_unlink=True)
+
+main_data = bpy.data.lights.new(name="Main", type='SUN')
+main_data.energy = 3.0
+main = bpy.data.objects.new(name="Main", object_data=main_data)
+bpy.context.collection.objects.link(main)
+main.location = (5, 5, 10)
+main.rotation_euler = (0.4, 0.3, 0.1)
+
+fill_data = bpy.data.lights.new(name="Fill", type='SUN')
+fill_data.energy = 1.5
+fill = bpy.data.objects.new(name="Fill", object_data=fill_data)
+bpy.context.collection.objects.link(fill)
+fill.location = (-5, -3, 8)
+fill.rotation_euler = (0.6, -0.2, -0.3)
+
+
+# ==========================================================
+# 5. Camera object
+# ==========================================================
+
+camera_data = bpy.data.cameras.new("SfM_Camera")
+camera = bpy.data.objects.new("SfM_Camera", camera_data)
+bpy.context.collection.objects.link(camera)
+scene.camera = camera
+camera_data.lens = 50  # natural ~human-eye focal length
+
+
+# ==========================================================
+# 6. Find the mesh model
+# ==========================================================
+
+model = None
+for obj in bpy.context.scene.objects:
+    if obj.type == "MESH":
+        model = obj
+        break
+
+if model is None:
+    raise Exception("No mesh model found")
+
+
+# ==========================================================
+# 7. Material - standard medium grey
+# ==========================================================
+
+model.data.materials.clear()
+
+mat = bpy.data.materials.new(name="Standard_Grey")
+mat.use_nodes = True
+
+bsdf = mat.node_tree.nodes["Principled BSDF"]
+bsdf.inputs['Base Color'].default_value = (0.6, 0.6, 0.6, 1.0)
+bsdf.inputs['Roughness'].default_value = 0.5
+bsdf.inputs['Metallic'].default_value = 0.0
+
+try:
+    bsdf.inputs['Specular IOR Level'].default_value = 0.5
+except KeyError:
+    try:
+        bsdf.inputs['Specular'].default_value = 0.5
+    except KeyError:
+        pass
+
+model.data.materials.append(mat)
+
+
+# ==========================================================
+# 8. Center & scale the model
+# ==========================================================
+
+bpy.ops.object.select_all(action='DESELECT')
+model.select_set(True)
+bpy.context.view_layer.objects.active = model
+bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
+
+bbox_corners = [model.matrix_world @ Vector(c) for c in model.bound_box]
+bbox_min = Vector((min(v.x for v in bbox_corners), min(v.y for v in bbox_corners), min(v.z for v in bbox_corners)))
+bbox_max = Vector((max(v.x for v in bbox_corners), max(v.y for v in bbox_corners), max(v.z for v in bbox_corners)))
+
+bbox_center = (bbox_min + bbox_max) / 2
+bbox_size = bbox_max - bbox_min
+original_bbox_size = bbox_size.copy()  # pre-scale dimensions, for dataset_info
+
+model.location = -bbox_center
+
+target_height = 5.0
+target_width = 3.0
+
+scale_x = target_width / bbox_size.x if bbox_size.x > 0 else 1
+scale_y = target_width / bbox_size.y if bbox_size.y > 0 else 1
+scale_z = target_height / bbox_size.z if bbox_size.z > 0 else 1
+
+model.scale = (scale_x, scale_y, scale_z)
+bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
+
+bbox_corners = [model.matrix_world @ Vector(c) for c in model.bound_box]
+bbox_min = Vector((min(v.x for v in bbox_corners), min(v.y for v in bbox_corners), min(v.z for v in bbox_corners)))
+bbox_max = Vector((max(v.x for v in bbox_corners), max(v.y for v in bbox_corners), max(v.z for v in bbox_corners)))
+
+center = (bbox_min + bbox_max) / 2
+bbox_size = bbox_max - bbox_min
+
+print(f"Model dimensions: W={bbox_size.x:.2f}, D={bbox_size.y:.2f}, H={bbox_size.z:.2f}")
+
+
+# ==========================================================
+# 9. Camera intrinsics (K) — computed once, shared by all views
+# ==========================================================
+
+width = scene.render.resolution_x
+height = scene.render.resolution_y
+
+f_mm = camera_data.lens
+sensor_width_mm = camera_data.sensor_width
+sensor_height_mm = camera_data.sensor_height if camera_data.sensor_fit == 'VERTICAL' else \
+    sensor_width_mm * height / width
+
+fx = width * f_mm / sensor_width_mm
+fy = height * f_mm / sensor_height_mm
+cx = width / 2.0
+cy = height / 2.0
+
+K = Matrix((
+    (fx, 0.0, cx),
+    (0.0, fy, cy),
+    (0.0, 0.0, 1.0)
+))
+
+# FOV straight from Blender (accounts for sensor fit automatically)
+fov_x_deg = math.degrees(camera_data.angle_x)
+fov_y_deg = math.degrees(camera_data.angle_y)
+
+intrinsics_dict = {
+    "fx": fx, "fy": fy, "cx": cx, "cy": cy,
+    "width": width, "height": height,
+    "K": [list(row) for row in K],
+    "sensor_width_mm": sensor_width_mm,
+    "sensor_height_mm": sensor_height_mm,
+    "lens_mm": f_mm,
+    "fov_x_deg": fov_x_deg,
+    "fov_y_deg": fov_y_deg,
+    "principal_point": [cx, cy],
+    "camera_model": "PINHOLE",
+    # Blender's virtual camera is an ideal pinhole (no real lens), so distortion
+    # is exactly zero. Kept explicit (rather than omitted) so downstream OpenCV/
+    # COLMAP code that expects a distortion field doesn't have to special-case it.
+    "distortion": {"k1": 0.0, "k2": 0.0, "k3": 0.0, "p1": 0.0, "p2": 0.0}
+}
+
+with open(INTRINSIC_FILE, "w") as f:
+    json.dump(intrinsics_dict, f, indent=4)
+
+
+# ==========================================================
+# 10. Camera sampling plan: 3 orbits x 18 azimuths (20 deg step)
+# ==========================================================
+
+model_diagonal = math.sqrt(bbox_size.x**2 + bbox_size.y**2 + bbox_size.z**2)
+
+ELEVATION_ANGLES_DEG = [-20, 0, 20]
+NUM_AZIMUTH = 18
+AZIMUTH_STEP_DEG = 360.0 / NUM_AZIMUTH
+
+# Slightly different radius per orbit (deterministic, not random) so the camera
+# doesn't sit on a perfectly ideal sphere - a bit closer to how a real capture
+# rig would vary distance between passes, without breaking reproducibility.
+RADIUS_MULTIPLIER_BY_ELEVATION = {-20: 1.8, 0: 2.0, 20: 2.2}
+radius = model_diagonal * 2.0  # kept for dataset_info as the nominal/reference radius
+
+TOTAL_IMAGES = NUM_AZIMUTH * len(ELEVATION_ANGLES_DEG)
+print(f"Total planned images: {TOTAL_IMAGES} "
+      f"({len(ELEVATION_ANGLES_DEG)} orbits x {NUM_AZIMUTH} views, "
+      f"{AZIMUTH_STEP_DEG:.1f} deg spacing)")
+
+
+# ==========================================================
+# Helper: Blender camera pose -> OpenCV-style (R, t, P)
+# ==========================================================
+
+BLENDER_TO_CV = Matrix((
+    (1, 0, 0),
+    (0, -1, 0),
+    (0, 0, -1)
+))
+
+
+def get_opencv_extrinsics(cam_obj):
+    """Returns (R_cv, t_cv) such that x_cam = R_cv @ X_world + t_cv,
+    in OpenCV pixel/camera convention."""
+    R_world2blendercam = cam_obj.matrix_world.to_3x3().transposed()
+    C = cam_obj.matrix_world.translation
+
+    R_cv = BLENDER_TO_CV @ R_world2blendercam
+    t_cv = BLENDER_TO_CV @ (-(R_world2blendercam @ C))
+
+    return R_cv, t_cv
+
+
+def project_point(K, R, t, X):
+    """Project a single 3D world point using K[R|t]. Returns (u, v, depth)."""
+    Xc = R @ X + t
+    depth = Xc.z
+    if depth <= 1e-6:
+        return None  # behind the camera
+    u = (K[0][0] * Xc.x + K[0][2] * Xc.z) / Xc.z
+    v = (K[1][1] * Xc.y + K[1][2] * Xc.z) / Xc.z
+    return u, v, depth
+
+
+# ==========================================================
+# 11. Render loop
+# ==========================================================
+
+poses = {}
+frame_index = 0
+frame_order = []  # filenames in render order, needed for neighbor lookup
+
+# Synthetic capture timestamps (no real camera involved, but useful if this
+# dataset is later repurposed for SLAM-style experiments).
+CAPTURE_START_TIME = datetime.datetime.now()
+SECONDS_PER_FRAME = 0.5
+
+for elev_idx, elev_deg in enumerate(ELEVATION_ANGLES_DEG):
+    elev = math.radians(elev_deg)
+    orbit_radius = model_diagonal * RADIUS_MULTIPLIER_BY_ELEVATION[elev_deg]
+    for j in range(NUM_AZIMUTH):
+        azim = math.radians(j * AZIMUTH_STEP_DEG)
+
+        x = orbit_radius * math.cos(elev) * math.cos(azim)
+        y = orbit_radius * math.cos(elev) * math.sin(azim)
+        z = center.z + orbit_radius * math.sin(elev)
+
+        camera.location = Vector((x, y, z))
+        direction = center - camera.location
+        camera.rotation_euler = direction.to_track_quat('-Z', 'Y').to_euler()
+
+        bpy.context.view_layer.update()  # ensure matrix_world is current
+
+        R_cv, t_cv = get_opencv_extrinsics(camera)
+        extrinsic_matrix = Matrix((
+            (R_cv[0][0], R_cv[0][1], R_cv[0][2], t_cv[0]),
+            (R_cv[1][0], R_cv[1][1], R_cv[1][2], t_cv[1]),
+            (R_cv[2][0], R_cv[2][1], R_cv[2][2], t_cv[2]),
+        ))
+        P = K @ extrinsic_matrix
+
+        q = camera.rotation_euler.to_quaternion()  # Blender Quaternion: (w, x, y, z)
+
+        filename = f"view_{frame_index:03d}.png"
+        filepath = os.path.join(IMAGE_DIR, filename)
+        scene.render.filepath = filepath
+        bpy.ops.render.render(write_still=True)
+
+        timestamp = (CAPTURE_START_TIME +
+                     datetime.timedelta(seconds=frame_index * SECONDS_PER_FRAME)).isoformat()
+
+        poses[filename] = {
+            "camera_location": list(camera.location),
+            "rotation_euler": list(camera.rotation_euler),
+            "rotation_quaternion_wxyz": [q.w, q.x, q.y, q.z],
+            "rotation_matrix": [list(row) for row in R_cv],
+            "translation": list(t_cv),
+            "extrinsic_matrix": [list(row) for row in extrinsic_matrix],  # [R|t], 3x4
+            "projection_matrix": [list(row) for row in P],
+            "camera_world_matrix_blender": [list(row) for row in camera.matrix_world],  # 4x4, Blender convention
+            "elevation_deg": elev_deg,
+            "azimuth_deg": j * AZIMUTH_STEP_DEG,
+            "elev_idx": elev_idx,
+            "azim_idx": j,
+            "orbit_id": f"orbit_{elev_idx}",
+            "orbit_radius": orbit_radius,
+            "image_width": width,
+            "image_height": height,
+            "timestamp": timestamp
+        }
+        frame_order.append(filename)
+
+        frame_index += 1
+
+print(f"Rendered {frame_index} images -> {IMAGE_DIR}")
+
+
+# ==========================================================
+# 11b. View neighbors — precomputed adjacency so the notebook doesn't have
+# to brute-force which image pairs are worth matching (adjacent azimuth in
+# the same orbit, wrap-around included, plus same azimuth in adjacent orbits)
+# ==========================================================
+
+num_elev = len(ELEVATION_ANGLES_DEG)
+lookup = {(pp["elev_idx"], pp["azim_idx"]): fn for fn, pp in poses.items()}
+
+for filename in frame_order:
+    p = poses[filename]
+    e, a = p["elev_idx"], p["azim_idx"]
+    neighbor_keys = []
+
+    # same-orbit neighbors (previous/next azimuth, wrap-around)
+    for da in (-1, 1):
+        na = (a + da) % NUM_AZIMUTH
+        neighbor_keys.append((e, na))
+
+    # adjacent-orbit neighbors (same azimuth, elevation above/below)
+    for de in (-1, 1):
+        ne = e + de
+        if 0 <= ne < num_elev:
+            neighbor_keys.append((ne, a))
+
+    p["view_neighbors"] = [lookup[k] for k in neighbor_keys if k in lookup]
+
+with open(POSE_FILE, "w") as f:
+    json.dump(poses, f, indent=4)
+
+
+# ==========================================================
+# 12. Ground-truth geometry: point cloud (.ply) + mesh (.obj)
+# ==========================================================
+
+vertices_world = [model.matrix_world @ v.co for v in model.data.vertices]
+
+# Correct normal transform: inverse-transpose of the 3x3 (handles non-uniform
+# scale correctly; a plain matrix_world @ normal would be wrong in general).
+normal_matrix = model.matrix_world.to_3x3().inverted_safe().transposed()
+normals_world = [(normal_matrix @ v.normal).normalized() for v in model.data.vertices]
+
+# Same flat grey as the render material (0.6, 0.6, 0.6), so the GT point cloud
+# looks consistent with the rendered images when opened in CloudCompare/Open3D/
+# MeshLab (which otherwise default to white/black points).
+VERTEX_COLOR_RGB = (153, 153, 153)  # 0.6 * 255, rounded
+
+
+def write_ply(filepath, points, normals, color_rgb):
+    with open(filepath, "w") as f:
+        f.write("ply\n")
+        f.write("format ascii 1.0\n")
+        f.write(f"element vertex {len(points)}\n")
+        f.write("property float x\n")
+        f.write("property float y\n")
+        f.write("property float z\n")
+        f.write("property float nx\n")
+        f.write("property float ny\n")
+        f.write("property float nz\n")
+        f.write("property uchar red\n")
+        f.write("property uchar green\n")
+        f.write("property uchar blue\n")
+        f.write("end_header\n")
+        r, g, b = color_rgb
+        for p, n in zip(points, normals):
+            f.write(f"{p.x:.6f} {p.y:.6f} {p.z:.6f} "
+                     f"{n.x:.6f} {n.y:.6f} {n.z:.6f} {r} {g} {b}\n")
+
+
+def write_obj(filepath, points, normals, polygons):
+    with open(filepath, "w") as f:
+        f.write("# Ground truth mesh (world space)\n")
+        for p in points:
+            f.write(f"v {p.x:.6f} {p.y:.6f} {p.z:.6f}\n")
+        for n in normals:
+            f.write(f"vn {n.x:.6f} {n.y:.6f} {n.z:.6f}\n")
+        for poly in polygons:
+            # vertex normal index == vertex index here (one normal per vertex),
+            # so "v//vn" pairs share the same 1-based index.
+            idx_str = " ".join(f"{i + 1}//{i + 1}" for i in poly.vertices)
+            f.write(f"f {idx_str}\n")
+
+
+write_ply(GROUND_TRUTH_POINT_CLOUD, vertices_world, normals_world, VERTEX_COLOR_RGB)
+write_obj(GROUND_TRUTH_MESH, vertices_world, normals_world, model.data.polygons)
+
+print(f"Ground truth point cloud saved -> {GROUND_TRUTH_POINT_CLOUD} "
+      f"({len(vertices_world)} vertices)")
+print(f"Ground truth mesh saved -> {GROUND_TRUTH_MESH} "
+      f"({len(model.data.polygons)} faces)")
+
+
+# ==========================================================
+# 13. Ground-truth 2D<->3D matches with REAL occlusion (BVH ray cast)
+# ==========================================================
+# Detector-agnostic by design: built from the model geometry alone, not from
+# SIFT/ORB/etc., so it can be used to evaluate ANY feature detector without
+# circularity. Visibility now requires:
+#   (a) point in front of the camera
+#   (b) projected pixel inside image bounds
+#   (c) unobstructed line of sight from camera to vertex (BVH ray cast)
+
+depsgraph = bpy.context.evaluated_depsgraph_get()
+bvh = BVHTree.FromObject(model, depsgraph)
+
+RAY_EPSILON = 1e-3  # stop just short of the target vertex to avoid self-hit on its own face
+
+
+def has_line_of_sight(cam_location, X):
+    direction = X - cam_location
+    distance = direction.length
+    if distance < 1e-9:
+        return True
+    direction.normalize()
+    hit_loc, hit_normal, hit_index, hit_dist = bvh.ray_cast(
+        cam_location, direction, distance - RAY_EPSILON
+    )
+    return hit_index is None  # None = nothing blocking before reaching the vertex
+
+
+matches = []
+
+image_names = frame_order  # fixed column order for the visibility matrix
+image_col = {name: i for i, name in enumerate(image_names)}
+visibility_matrix = np.zeros((len(vertices_world), len(image_names)), dtype=bool)
+
+for vid, X in enumerate(vertices_world):
+    observations = []
+    for filename, pose in poses.items():
+        R = Matrix(pose["rotation_matrix"])
+        t = Vector(pose["translation"])
+        cam_loc = Vector(pose["camera_location"])
+
+        result = project_point(K, R, t, X)
+        if result is None:
+            continue
+        u, v, depth = result
+        if not (0 <= u < width and 0 <= v < height):
+            continue
+        if not has_line_of_sight(cam_loc, X):
+            continue
+
+        visibility_matrix[vid, image_col[filename]] = True
+        observations.append({
+            "image": filename,
+            "pixel": [u, v],
+            "depth": depth,
+            "visible": True
+        })
+
+    if len(observations) >= 2:  # need 2+ views for triangulation
+        matches.append({
+            "vertex_id": vid,
+            "world_point": [X.x, X.y, X.z],
+            "observations": observations
+        })
+
+with open(MATCHES_FILE, "w") as f:
+    json.dump(matches, f, indent=4)
+
+np.save(VISIBILITY_MATRIX_FILE, visibility_matrix)
+with open(VISIBILITY_INDEX_FILE, "w") as f:
+    json.dump({
+        "shape": list(visibility_matrix.shape),
+        "rows": "vertex_id, 0..N-1, matches model.data.vertices order",
+        "columns": image_names
+    }, f, indent=4)
+
+print(f"Ground truth matches saved -> {MATCHES_FILE} "
+      f"({len(matches)} vertices with 2+ verified-visible observations)")
+print(f"Visibility matrix saved -> {VISIBILITY_MATRIX_FILE} "
+      f"(shape {visibility_matrix.shape}, True=verified visible)")
+
+
+# ==========================================================
+# 14. Dataset-level documentation
+# ==========================================================
+
+dataset_info = {
+    "dataset_name": "SfM Synthetic Benchmark",
+    "generator": "Blender (bpy) Cycles",
+    "blender_version": bpy.app.version_string,
+    "creation_date": datetime.datetime.now().isoformat(),
+    "model_name": model.name,
+    "vertex_count": len(model.data.vertices),
+    "face_count": len(model.data.polygons),
+    "bounding_box": {"min": list(bbox_min), "max": list(bbox_max)},
+    "images": TOTAL_IMAGES,
+    "camera_model": "PINHOLE",
+    "resolution": [width, height],
+    "num_orbits": len(ELEVATION_ANGLES_DEG),
+    "views_per_orbit": NUM_AZIMUTH,
+    "elevation_deg": ELEVATION_ANGLES_DEG,
+    "azimuth_step_deg": AZIMUTH_STEP_DEG,
+    "focal_length_mm": f_mm,
+    "camera_radius_nominal": radius,
+    "camera_radius_multiplier_by_elevation": RADIUS_MULTIPLIER_BY_ELEVATION,
+    "scale": "normalized (target height=5, width=3 Blender units)",
+    "original_dimensions_source_units": {
+        "width": original_bbox_size.x, "depth": original_bbox_size.y, "height": original_bbox_size.z
+    },
+    "scaled_dimensions_blender_units": {
+        "width": target_width, "depth": target_width, "height": target_height
+    },
+    "scale_factor_xyz": [scale_x, scale_y, scale_z],
+    "ground_truth_visibility": "ray-cast verified (BVH), not just frustum/bounds check",
+    "coordinate_convention": "OpenCV (R, t, P in camera_poses.json); "
+                              "camera_world_matrix_blender in camera_poses.json uses Blender's native convention"
+}
+
+with open(DATASET_INFO_FILE, "w") as f:
+    json.dump(dataset_info, f, indent=4)
+
+
+# ==========================================================
+# 14b. Dataset preview grid (quick visual sanity check)
+# ==========================================================
+
+try:
+    from PIL import Image
+
+    PREVIEW_FRAME_INDICES = [0, 9, 18, 27, 36, 45]  # spread across all 3 orbits
+    thumb_w, thumb_h = 480, 270
+    cols, rows = 3, 2
+
+    grid_img = Image.new("RGB", (thumb_w * cols, thumb_h * rows), (30, 30, 30))
+    pasted = 0
+    for i, frame_i in enumerate(PREVIEW_FRAME_INDICES):
+        src_path = os.path.join(IMAGE_DIR, f"view_{frame_i:03d}.png")
+        if not os.path.exists(src_path):
+            continue
+        thumb = Image.open(src_path).convert("RGB").resize((thumb_w, thumb_h))
+        col, row = i % cols, i // cols
+        grid_img.paste(thumb, (col * thumb_w, row * thumb_h))
+        pasted += 1
+
+    grid_img.save(PREVIEW_FILE)
+    print(f"Preview grid saved -> {PREVIEW_FILE} ({pasted} thumbnails)")
+except ImportError:
+    print("Pillow not installed - skipping preview.png (not required, just a convenience).")
+
+
+# ==========================================================
+# 14c. README.txt (auto-generated dataset summary)
+# ==========================================================
+
+readme_text = f"""SfM Synthetic Benchmark Dataset
+================================
+Generator : {dataset_info['generator']} (Blender {dataset_info['blender_version']})
+Created   : {dataset_info['creation_date']}
+Model     : {dataset_info['model_name']} ({dataset_info['vertex_count']} vertices, {dataset_info['face_count']} faces)
+
+Images        : {TOTAL_IMAGES} total ({len(ELEVATION_ANGLES_DEG)} orbits x {NUM_AZIMUTH} views/orbit)
+Elevations    : {ELEVATION_ANGLES_DEG} degrees
+Azimuth step  : {AZIMUTH_STEP_DEG:.1f} degrees
+Resolution    : {width} x {height}
+Camera model  : PINHOLE (zero distortion)
+Focal length  : {f_mm} mm
+Coordinates   : OpenCV convention (R, t, P) — ready for cv2.triangulatePoints /
+                recoverPose / solvePnP with no extra transforms.
+
+FOLDER STRUCTURE
+----------------
+images/                    rendered views                         [give to students]
+camera_intrinsics.json     shared K matrix + sensor/FOV/distortion [give to students]
+camera_poses.json          per-image R,t,P,quaternion + neighbors  [give to students]
+dataset_info.json          full dataset metadata                   [give to students]
+preview.png                quick visual sanity check                [give to students]
+
+teacher_only/               ANSWER KEY -- do not distribute to students
+  ground_truth_point_cloud.ply   vertices + normals + color
+  ground_truth_mesh.obj          mesh with faces + vertex normals
+  matches_gt.json                ray-cast-verified 2D<->3D correspondences
+  visibility_matrix.npy          dense (vertices x images) boolean visibility
+
+GROUND TRUTH NOTE
+-----------------
+Ground truth in teacher_only/ is derived from model geometry alone (real BVH
+ray-cast occlusion, not just frustum/bounds checks) and is NOT derived from
+any specific feature detector's output. This makes it valid for fairly
+comparing SIFT, ORB, AKAZE, or any other detector against the same reference,
+without circularity.
+"""
+
+with open(README_FILE, "w", encoding="utf-8") as f:
+    f.write(readme_text)
+
+print(f"README saved -> {README_FILE}")
+
+
+# ==========================================================
+# 15. Validation
+# ==========================================================
+
+expected_images = TOTAL_IMAGES
+actual_images = len([f for f in os.listdir(IMAGE_DIR) if f.endswith(".png")])
+
+assert actual_images == expected_images, \
+    f"Expected {expected_images} images, found {actual_images}"
+assert os.path.exists(POSE_FILE), "camera_poses.json missing"
+assert os.path.exists(INTRINSIC_FILE), "camera_intrinsics.json missing"
+assert os.path.exists(GROUND_TRUTH_POINT_CLOUD), "ground truth PLY missing"
+assert os.path.exists(GROUND_TRUTH_MESH), "ground truth OBJ missing"
+assert os.path.exists(MATCHES_FILE), "matches_gt.json missing"
+assert os.path.exists(VISIBILITY_MATRIX_FILE), "visibility_matrix.npy missing"
+assert os.path.exists(VISIBILITY_INDEX_FILE), "visibility_matrix_index.json missing"
+assert os.path.exists(DATASET_INFO_FILE), "dataset_info.json missing"
+assert os.path.exists(README_FILE), "README.txt missing"
+# preview.png is best-effort (skipped if Pillow isn't installed), not asserted
+
+print("Validation passed. Dataset generated successfully!")
+print(f"  Images:               {actual_images}")
+print(f"  Intrinsics:           {INTRINSIC_FILE}")
+print(f"  Poses:                {POSE_FILE}")
+print(f"  Dataset info:         {DATASET_INFO_FILE}")
+print(f"  README:               {README_FILE}")
+print(f"  Preview:              {PREVIEW_FILE} (if Pillow was available)")
+print(f"  [teacher_only] cloud: {GROUND_TRUTH_POINT_CLOUD}")
+print(f"  [teacher_only] mesh:  {GROUND_TRUTH_MESH}")
+print(f"  [teacher_only] matches: {MATCHES_FILE}")
+print(f"  [teacher_only] visibility: {VISIBILITY_MATRIX_FILE}")
