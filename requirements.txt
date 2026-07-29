@@ -1,1 +1,8 @@
+opencv-contrib-python
+numpy
+matplotlib
+pandas
+open3d
+tqdm
+Pillow
 
